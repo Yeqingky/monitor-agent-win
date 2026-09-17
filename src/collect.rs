@@ -126,13 +126,24 @@ pub struct Metrics {
 
 #[derive(Default)]
 pub struct Collector {
+    /// Interfaces named by `--nics`. Empty means the name tables decide;
+    /// non-empty means only these are counted.
+    nics: Vec<String>,
     prev_cpu: Option<(u64, u64)>,
     prev_net: Option<(Instant, u64, u64)>,
 }
 
 impl Collector {
-    pub fn new() -> Self {
-        Self::default()
+    /// `nics` empty counts every interface the name tables count; non-empty
+    /// counts only those, whatever the tables say about them.
+    ///
+    /// The tables guess from a name what the operator can see directly: on a
+    /// Proxmox host the same guest packet is booked on the physical port, on
+    /// `vmbr0` and on the VM's `tap`, and only the operator knows which of
+    /// those the hub should bill. A bridge named here therefore counts, which
+    /// is the case `--nics` exists for.
+    pub fn new(nics: Vec<String>) -> Self {
+        Self { nics, ..Self::default() }
     }
 
     pub fn facts(&self) -> Facts {
@@ -162,7 +173,7 @@ impl Collector {
         let (mem_total, mem_used) = mem_used(&mem);
         let (swap_total, swap_used) = swap_used(&mem);
         let (disk_total, disk_used) = disk_usage(&real_mount_points());
-        let (rx_total, tx_total) = net_totals();
+        let (rx_total, tx_total) = net_totals(&self.nics);
         let (rx, tx) = self.net_rate(rx_total, tx_total, Instant::now());
         let (tcp, udp) = conn_counts();
 
@@ -319,6 +330,10 @@ fn uptime() -> u64 {
 /// machine's address. [`is_stacked`] is not applied here: it answers whether
 /// bytes were already counted lower down, and a bridge holding the host address
 /// is both stacked and this machine.
+///
+/// `--nics` does not apply either. It selects which interfaces are billed, and
+/// on a Proxmox host the address sits on `vmbr0`, which such a list typically
+/// leaves out; filtering by it would report a host with no address at all.
 fn addresses() -> (String, String) {
     let (mut v4, mut v6) = (String::new(), String::new());
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
@@ -335,17 +350,17 @@ fn addresses() -> (String, String) {
 }
 
 /// Sums the kernel's lifetime byte counters, one count per byte on the wire.
-fn net_totals() -> (u64, u64) {
-    parse_net_dev(&fs::read_to_string("/proc/net/dev").unwrap_or_default())
+fn net_totals(nics: &[String]) -> (u64, u64) {
+    parse_net_dev(&fs::read_to_string("/proc/net/dev").unwrap_or_default(), nics)
 }
 
-fn parse_net_dev(text: &str) -> (u64, u64) {
+fn parse_net_dev(text: &str, nics: &[String]) -> (u64, u64) {
     let mut rx = 0u64;
     let mut tx = 0u64;
     for line in text.lines().skip(2) {
         let Some((name, rest)) = line.split_once(':') else { continue };
         let name = name.trim();
-        if skip_iface(name) || is_stacked(name) {
+        if !counted(name, nics) {
             continue;
         }
         let f: Vec<u64> = rest.split_whitespace().filter_map(|v| v.parse().ok()).collect();
@@ -355,6 +370,37 @@ fn parse_net_dev(text: &str) -> (u64, u64) {
         }
     }
     (rx, tx)
+}
+
+/// Whether an interface's bytes reach the hub.
+///
+/// With no `--nics` the name tables decide, on the interface's name alone. A
+/// named list replaces both of them: the tables exist for what the operator
+/// cannot tell us, and naming an interface is the operator telling us. Names
+/// match exactly -- these are kernel interface names, not prefixes -- and
+/// naming one twice still counts it once.
+fn counted(name: &str, nics: &[String]) -> bool {
+    if nics.is_empty() {
+        !skip_iface(name) && !is_stacked(name)
+    } else {
+        nics.iter().any(|n| n == name)
+    }
+}
+
+/// Named interfaces that /proc/net/dev does not list. A typo in `--nics`
+/// otherwise reports zero traffic for as long as the agent runs, which reads
+/// exactly like an idle host; the operator is told once at startup instead.
+///
+/// A name that is merely absent is not fatal: an interface can be down, or
+/// belong to a module not loaded yet.
+pub fn missing_nics(nics: &[String]) -> Vec<String> {
+    missing_interfaces(&fs::read_to_string("/proc/net/dev").unwrap_or_default(), nics)
+}
+
+fn missing_interfaces(text: &str, nics: &[String]) -> Vec<String> {
+    let known: Vec<&str> =
+        text.lines().skip(2).filter_map(|line| line.split_once(':')).map(|(name, _)| name.trim()).collect();
+    nics.iter().filter(|n| !known.contains(&n.as_str())).cloned().collect()
 }
 
 fn skip_iface(name: &str) -> bool {
@@ -620,7 +666,7 @@ mod tests {
         // A counter that moved backwards indicates a reboot, not 100% busy.
         assert_eq!(busy_percent((1000, 925), (500, 400)), 0.0);
         // The first call has no baseline, so it reports 0.
-        assert_eq!(Collector::new().cpu_percent(), 0.0);
+        assert_eq!(Collector::new(Vec::new()).cpu_percent(), 0.0);
     }
 
     #[test]
@@ -655,7 +701,50 @@ mod tests {
                 vmbr0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
              eth0.100: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
               vlan100: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n";
-        assert_eq!(parse_net_dev(dev), (1000, 2000));
+        assert_eq!(parse_net_dev(dev, &[]), (1000, 2000));
+    }
+
+    /// `--nics` replaces the name tables instead of adding to them: an
+    /// operator naming `vmbr0` on a Proxmox host is choosing the bridge the
+    /// guest traffic is already booked on, and one naming `wg0` wants the
+    /// tunnel counted rather than its carrier. A name left out is silent even
+    /// where the tables would have counted it, or the flag could not subtract
+    /// the duplicate interfaces it exists for.
+    #[test]
+    fn named_interfaces_override_the_name_tables() {
+        let dev = "Inter-|   Receive\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n\
+                   eth0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
+                vmbr0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
+                  wg0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
+                 eth1: 7000 1 0 0 0 0 0 0 8000 2 0 0 0 0 0 0\n";
+        let nics = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_net_dev(dev, &nics(&["eth0", "eth1"])), (8000, 10000));
+        // A bridge and a tunnel, both of which the tables reject on their own.
+        assert_eq!(parse_net_dev(dev, &nics(&["vmbr0"])), (1000, 2000));
+        assert_eq!(parse_net_dev(dev, &nics(&["wg0", "eth1"])), (7300, 8400));
+        // Naming one interface twice is one interface, not two.
+        assert_eq!(parse_net_dev(dev, &nics(&["eth0", "eth0"])), (1000, 2000));
+        // Matching is exact: `eth` is a prefix, not an interface name.
+        assert_eq!(parse_net_dev(dev, &nics(&["eth"])), (0, 0));
+        assert_eq!(parse_net_dev(dev, &nics(&["nope"])), (0, 0));
+        // An empty list is the default, not "count nothing": the tables decide,
+        // which here means both real NICs and neither the bridge nor the tunnel.
+        assert_eq!(parse_net_dev(dev, &[]), (8000, 10000));
+    }
+
+    /// A name the kernel does not have means zero traffic for as long as the
+    /// agent runs, which reads exactly like an idle host. The operator is told
+    /// once at startup instead of finding out from the panel weeks later.
+    #[test]
+    fn a_named_interface_the_kernel_does_not_have_is_reported() {
+        let dev = "Inter-|   Receive\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n\
+                   eth0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n";
+        let nics = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(missing_interfaces(dev, &nics(&["eth0"])), Vec::<String>::new());
+        // A down or not-yet-loaded interface is worth naming, a typo most of all.
+        assert_eq!(missing_interfaces(dev, &nics(&["eth2", "et0"])), nics(&["eth2", "et0"]));
+        assert_eq!(missing_interfaces("", &nics(&["eth0"])), nics(&["eth0"]));
+        assert_eq!(missing_interfaces(dev, &[]), Vec::<String>::new());
     }
 
     /// The two questions asked of an interface name, and why one list cannot
@@ -677,7 +766,7 @@ mod tests {
 
     #[test]
     fn net_rate_is_zero_on_first_sample_and_after_a_reboot() {
-        let mut c = Collector::new();
+        let mut c = Collector::new(Vec::new());
         let t0 = Instant::now();
         assert_eq!(c.net_rate(1000, 2000, t0), (0, 0));
         let t1 = t0 + std::time::Duration::from_secs(2);
@@ -737,7 +826,7 @@ mod tests {
 
     #[test]
     fn real_host_collection_is_sane() {
-        let mut c = Collector::new();
+        let mut c = Collector::new(Vec::new());
         let f = c.facts();
         assert!(!f.hostname.is_empty() && f.cpu_cores >= 1 && f.mem_total > 0);
         // Whatever this host reports must parse, and a virtual bridge must not
@@ -773,7 +862,7 @@ mod crosscheck {
     /// Values are printed, so `cargo test crosscheck -- --nocapture` shows them.
     #[test]
     fn memory_and_disk_agree_with_free_and_df_on_this_machine() {
-        let mut c = Collector::new();
+        let mut c = Collector::new(Vec::new());
         let m = c.collect();
         let gib = |b: u64| b as f64 / 1024.0 / 1024.0 / 1024.0;
         println!("mem  used={:.2}G total={:.2}G", gib(m.mem_used), gib(m.mem_total));

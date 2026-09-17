@@ -24,29 +24,39 @@ struct Args {
     server: String,
     token: String,
     interval: u64,
+    /// Interfaces whose traffic is billed. Empty means every interface the
+    /// name tables count.
+    nics: Vec<String>,
     /// Permits plain HTTP to a hub reached at ip:port with no TLS in front.
     /// Off by default: the token would otherwise travel in the clear.
     insecure: bool,
 }
 
+/// Printed on `--help` and on any argument error. A raw literal rather than
+/// line continuations: `\`-continuations strip the leading whitespace of the
+/// next source line, which silently flattened every description's second line.
+const USAGE: &str = r#"Usage: monitor-agent --server <url> --token <token> [options]
+
+Options:
+  --server <url>       Hub base URL, e.g. https://hub.example.com
+  --token <token>      Node token from the hub panel
+  --interval <secs>    Report interval (default 1)
+  --nics <list>        Count only these interfaces, comma separated
+                       (e.g. eth0,eth1). Without it every interface the
+                       built-in name tables count is summed; with it those
+                       tables are replaced, so naming a bridge or a tunnel
+                       counts that device.
+  --insecure           Allow plain ws:// to a remote hub; the token travels
+                       in the clear. Only for a hub reached at ip:port with
+                       no TLS in front."#;
+
 fn usage() -> ! {
-    eprintln!(
-        "monitor-agent {}\n\n\
-         Usage: monitor-agent --server <url> --token <token> [options]\n\n\
-         Options:\n  \
-           --server <url>       Hub base URL, e.g. https://hub.example.com\n  \
-           --token <token>      Node token from the hub panel\n  \
-           --interval <secs>    Report interval (default 1)\n  \
-           --insecure           Allow plain ws:// to a remote hub; the token\n  \
-                                travels in the clear. Only for a hub reached\n  \
-                                at ip:port with no TLS in front.\n",
-        env!("CARGO_PKG_VERSION")
-    );
+    eprintln!("monitor-agent {}\n\n{USAGE}", env!("CARGO_PKG_VERSION"));
     std::process::exit(2)
 }
 
 fn parse_args() -> Result<Args> {
-    let (mut server, mut token, mut interval, mut insecure) = (None, None, 1u64, false);
+    let (mut server, mut token, mut interval, mut nics, mut insecure) = (None, None, 1u64, Vec::new(), false);
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -54,6 +64,7 @@ fn parse_args() -> Result<Args> {
             "--server" => server = Some(value()),
             "--token" => token = Some(value()),
             "--interval" => interval = value().parse().unwrap_or_else(|_| usage()),
+            "-nics" | "--nics" => nics = parse_nics(&value()),
             "--insecure" => insecure = true,
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
@@ -61,7 +72,17 @@ fn parse_args() -> Result<Args> {
     }
     let server = server.or_else(|| std::env::var("MONITOR_SERVER").ok()).unwrap_or_else(|| usage());
     let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), insecure })
+    Ok(Args { server, token, interval: interval.clamp(1, 3600), nics, insecure })
+}
+
+/// `--nics eth0,eth1` -> `["eth0", "eth1"]`. Whitespace around a name is
+/// trimmed because a value arriving from a shell variable or a unit file
+/// often carries it, and an interface name never contains a space.
+///
+/// Duplicates are kept: they cost nothing, because the sum is taken once per
+/// line in /proc/net/dev rather than once per entry.
+fn parse_nics(value: &str) -> Vec<String> {
+    value.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned).collect()
 }
 
 /// `https://host/path` -> `wss://host/path/api/agent/ws`. The token travels in
@@ -178,7 +199,10 @@ async fn main() -> Result<()> {
     for mount in collect::shadowed_mounts(&std::fs::read_to_string("/proc/self/mounts").unwrap_or_default()) {
         eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
     }
-    let mut collector = Collector::new();
+    let mut collector = Collector::new(args.nics.clone());
+    for nic in collect::missing_nics(&args.nics) {
+        eprintln!("interface {nic} is not listed in /proc/net/dev; it is counted as 0 bytes");
+    }
     let mut wait = 0u64;
 
     loop {
@@ -478,6 +502,19 @@ mod tests {
         assert_eq!(reconnect_wait(60, Duration::from_secs(3600)), 1);
         // Connected but dropped too early to prove anything: still a retreat.
         assert_eq!(reconnect_wait(4, Duration::from_secs(29)), 8);
+    }
+
+    #[test]
+    fn nics_accepts_both_spellings_and_ignores_padding() {
+        assert_eq!(parse_nics("eth0,eth1"), ["eth0", "eth1"]);
+        // A value from a unit file or a shell variable arrives with spaces.
+        assert_eq!(parse_nics(" eth0 , eth1 "), ["eth0", "eth1"]);
+        // A single interface is the common case, and a trailing comma from a
+        // generated list is not an interface name.
+        assert_eq!(parse_nics("vmbr0"), ["vmbr0"]);
+        assert_eq!(parse_nics("eth0,"), ["eth0"]);
+        // `--nics ""` is not a way to count nothing; it is no list at all.
+        assert!(parse_nics("  ,  ").is_empty());
     }
 
     #[test]

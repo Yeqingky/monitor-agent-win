@@ -34,6 +34,7 @@ monitor-agent --server https://your-hub --token <token>
 | `--server` | 必填 | hub 地址，也可用 `MONITOR_SERVER` |
 | `--token` | 必填 | 节点 token，也可用 `MONITOR_TOKEN` |
 | `--interval` | 1 | 上报间隔（秒），1–3600 |
+| `--nics` | 空 | 只统计这些网卡，逗号分隔，如 `eth0,eth1`；也可写作 `-nics` |
 
 ## 上报字段
 
@@ -44,6 +45,28 @@ monitor-agent --server https://your-hub --token <token>
 
 `net_rx_total` / `net_tx_total` 为内核 lifetime 计数器，原样上报；`boot_id` 取自
 `/proc/sys/kernel/random/boot_id`，是 hub 判定主机重启的唯一依据，**不要删**。
+
+### 网卡选择
+
+默认按内置名称表求和：跳过 `lo`、容器网络与隧道，并排除 `is_stacked` 的网卡（bond、
+bridge、VLAN），因为这些设备的字节在内层已经被计过一次。
+
+名称表只能靠名字猜，而 PVE、iStoreOS 这类主机上同一个包会被计多次——例如客户机的流量
+同时记在物理口、`vmbr0` 和 `tap` 上，只有操作者知道 hub 该按哪个口径计费。`--nics`
+用于这种情况：
+
+```bash
+monitor-agent --server https://your-hub --token <token> --nics eth0,eth1
+```
+
+- 给出 `--nics` 后，列表**替换**上面两张名称表，不再叠加。因此列出的 bridge 或隧道会被
+  统计，未列出的 `eth0` 也不会被统计。
+- 名称精确匹配（`eth` 不是 `eth0` 的前缀匹配），重复列出的名称仍只计一次。
+- 列表为空（不传或传空串）等同于默认行为，不是“统计为零”。
+- 名称不在 `/proc/net/dev` 中时启动会打印一行提示，避免把拼错的名字当成空闲主机。
+
+`--nics` 只影响流量统计。`Facts` 里的本机 IPv4 / IPv6 仍按 `SKIP_IFACES` 选取，否则在
+PVE 上地址位于 `vmbr0`，而该口通常不会出现在列表里。
 
 协议说明见 [hub 仓库](https://github.com/monitor-probe/monitor)。
 
