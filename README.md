@@ -1,3 +1,5 @@
+> **免责声明**: 本项目完全由 AI 生成。使用本项目产生的一切后果由使用者自行承担，项目作者不对任何直接或间接损失负责。
+
 # monitor-agent
 
 `monitor-agent` 是 monitor hub 的 Windows 主机 agent, 使用 WebSocket 上报本机指标并执行 hub 下发的 TCP 探测任务.
