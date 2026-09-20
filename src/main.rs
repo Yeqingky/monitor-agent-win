@@ -7,6 +7,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::Write,
+    os::windows::ffi::OsStringExt,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -25,6 +26,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 
 use collect::Collector;
 use windows_service::{
@@ -268,10 +270,26 @@ fn write_config(args: &Args) -> Result<()> {
     harden_config(&args.config_path)
 }
 
+fn system_icacls_path() -> Result<PathBuf> {
+    let mut buffer = vec![0u16; 260];
+    loop {
+        let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error()).context("get Windows system directory");
+        }
+        let length = length as usize;
+        if length < buffer.len() {
+            buffer.truncate(length);
+            return Ok(PathBuf::from(OsString::from_wide(&buffer)).join("icacls.exe"));
+        }
+        buffer.resize(length + 1, 0);
+    }
+}
+
 fn harden_config(path: &Path) -> Result<()> {
-    let output = Command::new("icacls.exe")
+    let output = Command::new(system_icacls_path()?)
         .arg(path)
-        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F"])
+        .args(["/inheritancelevel:r", "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F"])
         .output()
         .context("run icacls")?;
     if !output.status.success() {

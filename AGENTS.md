@@ -40,6 +40,7 @@ Windows 交叉编译需要 `x86_64-w64-mingw32-gcc`. 本机没有 Windows runtim
 - `--service-name` 默认为 `monitor-agent`. 相同服务名的 `install` 是升级和配置修改, 不同服务名必须使用独立配置目录并允许共存.
 - `install` 必须将当前 exe 复制到 `%ProgramData%\monitor-agent\monitor-agent.exe`, Service 不得依赖临时目录中的 exe. 替换共享副本前必须停止已配置的 agent 实例, 完成后恢复.
 - 默认配置文件位于 `%ProgramData%\monitor-agent\agent.env`, 其他服务名使用 `%ProgramData%\monitor-agent\<service-name>.env`, 安装时必须移除继承权限, 只允许 `SYSTEM` 和 Administrators 访问.
+- 配置文件 ACL 加固必须使用 Win32 API 获取的 `%SystemRoot%\System32\icacls.exe` 绝对路径, 禁止依赖 `PATH` 搜索可执行文件.
 - Windows Service 必须支持 Stop 和 Shutdown, 正常退出时报告 `Stopped`, 异常退出时由 SCM failure actions 自动重启.
 - hub 下发的 ping task 必须有并发上限, 不能信任 hub 提供的任务数量.
 - 采集失败时优先返回 0 或空值并继续上报, 不得因为单个可选指标让 WebSocket 主循环退出.
