@@ -3,8 +3,8 @@ name = "monitor-agent"
 version = "1.0.0"
 edition = "2021"
 license = "MIT"
-description = "Linux monitoring agent for the monitor hub"
-repository = "https://github.com/monitor-probe/agent"
+description = "Windows monitoring agent for the monitor hub"
+repository = "https://github.com/Yeqingky/monitor-agent-win"
 
 [dependencies]
 anyhow = "1"
@@ -13,7 +13,6 @@ serde_json = "1"
 # A single-threaded runtime suffices: one report every few seconds plus a
 # handful of TCP probes.
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util"] }
-rustix = { version = "1", features = ["fs"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 # tokio-tungstenite 0.28 leaves the crypto provider to the caller: rustls
 # selects one automatically only when exactly one provider feature is enabled.
@@ -21,6 +20,21 @@ tokio-tungstenite = { version = "0.28", default-features = false, features = ["c
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 if-addrs = "0.15.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-service = "0.8.1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Wdk_System_SystemServices",
+] }
 
 [dev-dependencies]
 # Only the tests need a movable clock; the write-deadline arithmetic spans

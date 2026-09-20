@@ -3,12 +3,10 @@ name: ci
 on:
   push:
     branches: [main]
-    # Prose changes nothing a compiler or linter can check.
     paths-ignore: ["**.md", "LICENSE"]
   pull_request:
     paths-ignore: ["**.md", "LICENSE"]
 
-# A new push supersedes any run still in progress for the same ref.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -16,14 +14,14 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # A hanging test would otherwise consume the six-hour default; the suite
-    # runs in well under a second.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
+          targets: x86_64-pc-windows-gnu
           components: clippy, rustfmt
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo check --locked --target x86_64-pc-windows-gnu
+      - run: cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets -- -D warnings
