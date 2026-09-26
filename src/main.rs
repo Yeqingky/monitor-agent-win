@@ -28,7 +28,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 
-use collect::Collector;
+use collect::{Collector, Ifaces};
 use windows_service::{
     define_windows_service,
     service::{
@@ -46,9 +46,8 @@ struct Args {
     server: String,
     token: String,
     interval: u64,
-    /// Adapter aliases whose traffic is billed. Empty means the default
-    /// physical-interface filter is used.
-    nics: Vec<String>,
+    /// Adapter aliases selected by `--iface`; empty uses the default filter.
+    ifaces: Ifaces,
     service_name: String,
     /// Permits plain HTTP to a hub reached at ip:port with no TLS in front.
     /// Off by default: the token would otherwise travel in the clear.
@@ -82,8 +81,9 @@ Options:
   --config <path>      Config file (default: per-service ProgramData path)
   --service-name <name> Service name (default: monitor-agent)
   --interval <secs>    Report interval (default 1)
-  --nics <list>        Count only these adapter aliases, comma separated
-                       (e.g. Ethernet,Wi-Fi)
+  --iface <list>       Select adapter aliases; -name excludes from defaults
+                       (e.g. Ethernet,-vEthernet (WSL))
+  --nics <list>        Legacy alias: count only these adapter aliases
   --insecure           Allow plain ws:// to a remote hub; the token travels
                        in the clear. Only for a hub reached at ip:port with
                        no TLS in front."#;
@@ -101,7 +101,7 @@ fn parse_options<I>(args: I) -> Result<Args>
 where
     I: IntoIterator<Item = String>,
 {
-    let (mut server, mut token, mut interval, mut nics, mut insecure) = (None, None, None, None, None);
+    let (mut server, mut token, mut interval, mut iface, mut insecure) = (None, None, None, None, None);
     let mut config_path = None;
     let mut explicit_config = false;
     let mut service_name = None;
@@ -119,7 +119,8 @@ where
             "--interval" => {
                 interval = Some(value()?.parse().context("--interval must be an integer")?);
             }
-            "-nics" | "--nics" => nics = Some(parse_nics(&value()?)),
+            "--iface" => iface = Some((value()?, false)),
+            "-nics" | "--nics" => iface = Some((value()?, true)),
             "--insecure" => insecure = Some(true),
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
@@ -151,10 +152,16 @@ where
         .or_else(|| config_value("MONITOR_INTERVAL").and_then(|v| v.parse().ok()))
         .or_else(|| std::env::var("MONITOR_INTERVAL").ok().and_then(|v| v.parse().ok()))
         .unwrap_or(1);
-    let nics = nics
-        .or_else(|| config_value("MONITOR_NICS").map(parse_nics))
-        .or_else(|| std::env::var("MONITOR_NICS").ok().map(|v| parse_nics(&v)))
-        .unwrap_or_default();
+    let iface_setting = iface
+        .or_else(|| config_value("MONITOR_IFACE").map(|value| (value.to_owned(), false)))
+        .or_else(|| config_value("MONITOR_NICS").map(|value| (value.to_owned(), true)))
+        .or_else(|| std::env::var("MONITOR_IFACE").ok().map(|value| (value, false)))
+        .or_else(|| std::env::var("MONITOR_NICS").ok().map(|value| (value, true)));
+    let ifaces = match iface_setting {
+        Some((value, true)) => Ifaces::from_legacy(parse_nics(&value)),
+        Some((value, false)) => Ifaces::parse(&value).map_err(anyhow::Error::msg)?,
+        None => Ifaces::default(),
+    };
     let insecure = match insecure {
         Some(value) => value,
         None => match config_value("MONITOR_INSECURE") {
@@ -165,7 +172,7 @@ where
             },
         },
     };
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), nics, service_name, insecure, config_path })
+    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, service_name, insecure, config_path })
 }
 
 fn default_config_path(service_name: &str) -> PathBuf {
@@ -254,16 +261,17 @@ fn validate_config_value(name: &str, value: &str) -> Result<()> {
 fn write_config(args: &Args) -> Result<()> {
     validate_config_value("server", &args.server)?;
     validate_config_value("token", &args.token)?;
+    validate_config_value("iface", args.ifaces.spec())?;
     if let Some(parent) = args.config_path.parent() {
         fs::create_dir_all(parent)?;
     }
     let content = format!(
-        "MONITOR_SERVICE_NAME={}\nMONITOR_SERVER={}\nMONITOR_TOKEN={}\nMONITOR_INTERVAL={}\nMONITOR_NICS={}\nMONITOR_INSECURE={}\n",
+        "MONITOR_SERVICE_NAME={}\nMONITOR_SERVER={}\nMONITOR_TOKEN={}\nMONITOR_INTERVAL={}\nMONITOR_IFACE={}\nMONITOR_INSECURE={}\n",
         args.service_name,
         args.server,
         args.token,
         args.interval,
-        args.nics.join(","),
+        args.ifaces.spec(),
         if args.insecure { 1 } else { 0 },
     );
     fs::write(&args.config_path, content)?;
@@ -647,9 +655,8 @@ fn start_service_dispatcher(service_name: &str) -> Result<()> {
     service_dispatcher::start(service_name, ffi_service_main).context("start service dispatcher")
 }
 
-/// `--nics Ethernet,Wi-Fi` -> `["Ethernet", "Wi-Fi"]`. Whitespace around a name is
-/// trimmed because a value arriving from a shell variable or a unit file
-/// often carries it, and an interface name never contains a space.
+/// `--nics Ethernet,Wi-Fi` -> `["Ethernet", "Wi-Fi"]`. Whitespace around
+/// each list entry is trimmed while internal spaces in adapter aliases remain.
 ///
 /// Duplicates are kept: they cost nothing, because each operating-system
 /// interface row is summed once rather than once per list entry.
@@ -791,10 +798,11 @@ fn main() -> Result<()> {
 
 async fn run_agent(args: Args, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     let url = ws_url(&args.server, args.insecure)?;
-    let mut collector = Collector::new(args.nics.clone());
-    for nic in collect::missing_nics(&args.nics) {
-        agent_log!("interface {nic} is not listed by the operating system; it is counted as 0 bytes");
+    let mut collector = Collector::new(args.ifaces.clone());
+    for iface in collector.missing_ifaces() {
+        agent_log!("interface {iface} is not listed by the operating system; it is counted as 0 bytes");
     }
+    agent_log!("counting traffic on: {}", collector.counted_ifaces().join(", "));
     let mut wait = 0u64;
 
     loop {
@@ -845,6 +853,8 @@ fn reconnect_wait(previous: u64, lasted: Duration) -> u64 {
 /// slowest measured sixty. This is not a latency budget but the point past
 /// which nothing is expected to arrive.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(120);
+/// Bound a failed address so a black-holed IPv6 route yields to the next address.
+const DIAL_FALLBACK: Duration = Duration::from_secs(5);
 
 /// The hub sends one kind of message, a probe list a few hundred bytes long.
 /// Tungstenite's 64 MiB default would hand the peer this process's entire
@@ -877,15 +887,31 @@ async fn session(
         .insert("authorization", format!("Bearer {token}").parse().context("token is not header-safe")?);
     let config =
         WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
-    let connect = tokio_tungstenite::connect_async_with_config(request, Some(config), false);
+    let uri = request.uri();
+    let host = uri
+        .host()
+        .context("server URL has no host")?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
+    let facts = collector.facts();
+    let connect = async {
+        let stream = dial(&host, port, prefers_ipv4(&facts.ipv4)).await?;
+        let peer = stream.peer_addr()?;
+        let (ws, _) = tokio_tungstenite::client_async_tls_with_config(request, stream, Some(config), None)
+            .await
+            .context("handshake")?;
+        anyhow::Ok((ws, peer))
+    };
     let connect_result = tokio::select! {
         result = tokio::time::timeout(CONNECT_DEADLINE, connect) => result,
         _ = shutdown.changed() => return Ok(()),
     };
-    let (mut ws, _) = connect_result
+    let (mut ws, peer) = connect_result
         .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))?
         .context("connect")?;
-    agent_log!("connected");
+    agent_log!("connected to {peer}");
     *connected = Some(Instant::now());
     // The clock starts at the handshake and the hello below draws from it like
     // every other write, so no two writes can each claim a full HUB_SILENCE.
@@ -893,7 +919,7 @@ async fn session(
 
     let Some(result) = send_or_stop(
         &mut ws,
-        notify("hello", serde_json::to_value(collector.facts())?),
+        notify("hello", serde_json::to_value(facts)?),
         remaining(last_frame),
         shutdown.clone(),
     )
@@ -960,6 +986,47 @@ async fn session(
         handle.abort();
     }
     result
+}
+
+/// A private local IPv4 means the hub can learn the host's public NAT address
+/// only from a connection that arrives over IPv4.
+fn prefers_ipv4(ipv4: &str) -> bool {
+    ipv4.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| !collect::is_public(ip.into()))
+}
+
+fn sort_addresses(addrs: &mut [std::net::SocketAddr], prefer_v4: bool) {
+    if prefer_v4 {
+        addrs.sort_by_key(|addr| !addr.is_ipv4());
+    }
+}
+
+async fn dial(host: &str, port: u16, prefer_v4: bool) -> Result<TcpStream> {
+    let mut addrs: Vec<std::net::SocketAddr> =
+        tokio::net::lookup_host((host, port)).await.with_context(|| format!("resolve {host}"))?.collect();
+    sort_addresses(&mut addrs, prefer_v4);
+    connect_first(&addrs).await.with_context(|| format!("connect {host}"))
+}
+
+async fn connect_first(addrs: &[std::net::SocketAddr]) -> Result<TcpStream> {
+    let mut failures = Vec::new();
+    for (index, addr) in addrs.iter().enumerate() {
+        let attempt = TcpStream::connect(addr);
+        let result = if index + 1 < addrs.len() {
+            tokio::time::timeout(DIAL_FALLBACK, attempt)
+                .await
+                .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+        } else {
+            attempt.await
+        };
+        match result {
+            Ok(stream) => return Ok(stream),
+            Err(error) => failures.push(format!("{addr}: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        bail!("no address");
+    }
+    bail!("{}", failures.join("; "))
 }
 
 /// Ceiling on concurrent probe loops.
@@ -1136,6 +1203,38 @@ mod tests {
         assert_eq!(parse_nics("Ethernet,"), ["Ethernet"]);
         // `--nics ""` is not a way to count nothing; it is no list at all.
         assert!(parse_nics("  ,  ").is_empty());
+    }
+
+    #[test]
+    fn private_ipv4_triggers_ipv4_priority_only_for_nat_hosts() {
+        assert!(prefers_ipv4("10.0.0.2"));
+        assert!(prefers_ipv4("100.64.1.2"));
+        assert!(!prefers_ipv4("8.8.8.8"));
+        assert!(!prefers_ipv4(""));
+    }
+
+    #[test]
+    fn address_sort_prefers_ipv4_only_when_requested() {
+        let v4: std::net::SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let v6: std::net::SocketAddr = "[::1]:80".parse().unwrap();
+        let original = [v6, v4];
+        let mut addresses = original;
+        sort_addresses(&mut addresses, true);
+        assert!(addresses[0].is_ipv4());
+        let mut addresses = original;
+        sort_addresses(&mut addresses, false);
+        assert_eq!(addresses, original, "normal hosts retain resolver order");
+    }
+
+    #[tokio::test]
+    async fn hub_dial_tries_the_next_address_after_a_refusal() {
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        let stream = connect_first(&[dead, live]).await.unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), live);
     }
 
     #[test]

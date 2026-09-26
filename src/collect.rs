@@ -3,13 +3,17 @@
 //! This module uses system-information, IP Helper, registry and file-system
 //! APIs instead of shelling out to PowerShell or depending on localized output.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::net::IpAddr;
 use std::ptr::{null, null_mut};
 use std::slice;
 use std::time::Instant;
 
 use serde::Serialize;
+use windows_sys::core::GUID;
+use windows_sys::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemTimeOfDayInformation};
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 use windows_sys::Win32::Foundation::{FILETIME, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -27,10 +31,98 @@ use windows_sys::Win32::System::SystemInformation::{
     GlobalMemoryStatusEx, MEMORYSTATUSEX, OSVERSIONINFOW,
 };
 use windows_sys::Win32::System::Threading::GetSystemTimes;
+use windows_sys::Win32::System::WindowsProgramming::SYSTEM_TIMEOFDAY_INFORMATION;
 
 const DRIVE_FIXED: u32 = 3;
 const WINDOWS_FILETIME_UNIX_OFFSET: u64 = 11644473600 * 10_000_000;
 const LOAD_WINDOWS: [f32; 3] = [60.0, 300.0, 900.0];
+const SYSTEM_BOOT_ENVIRONMENT_INFORMATION_CLASS: i32 = 90;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SystemBootEnvironmentInfo {
+    boot_identifier: GUID,
+    _firmware_type: u32,
+    _boot_flags: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ifaces {
+    spec: String,
+    only: Vec<String>,
+    skip: Vec<String>,
+}
+
+impl Ifaces {
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        if spec.chars().any(char::is_control) {
+            return Err("--iface: control characters are not valid in adapter aliases".into());
+        }
+        let entries: Vec<&str> = spec.split(',').map(str::trim).filter(|entry| !entry.is_empty()).collect();
+        let mut ifaces = Self { spec: entries.join(","), ..Self::default() };
+        for entry in entries {
+            let (list, name) = match entry.strip_prefix('-') {
+                Some(name) => (&mut ifaces.skip, name),
+                None => (&mut ifaces.only, entry),
+            };
+            if name.is_empty() || name.starts_with('-') || name.chars().any(char::is_control) {
+                return Err(format!("--iface: {entry:?} is not a valid adapter alias"));
+            }
+            list.push(name.to_owned());
+        }
+        Ok(ifaces)
+    }
+
+    pub fn from_legacy(nics: Vec<String>) -> Self {
+        Self { spec: nics.join(","), only: nics, skip: Vec::new() }
+    }
+
+    pub fn spec(&self) -> &str {
+        &self.spec
+    }
+
+    pub fn only(&self) -> &[String] {
+        &self.only
+    }
+
+    fn counts(&self, row: &MIB_IF_ROW2) -> bool {
+        let name = interface_name(row);
+        if self.skip.iter().any(|excluded| excluded == &name) {
+            return false;
+        }
+        if !self.only.is_empty() {
+            return self.only.iter().any(|selected| selected == &name);
+        }
+        row.Type != 24 && row.Type != 131 && !skip_iface(&name)
+    }
+}
+
+fn epoch<'a>(boot_id: &str, names: impl Iterator<Item = &'a str>) -> String {
+    let mut names: Vec<&str> = names.collect();
+    names.sort_unstable();
+    let digest = names
+        .join("\n")
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3));
+    format!("{boot_id}/{digest:016x}")
+}
+
+pub fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || a == 0
+                || a >= 224
+                || (a == 100 && b & 0xc0 == 64)
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && b & 0xfe == 18))
+        }
+        IpAddr::V6(v6) => v6.segments()[0] & 0xe000 == 0x2000,
+    }
+}
 
 const VIRTUAL_INTERFACE_WORDS: &[&str] = &[
     "loopback",
@@ -71,6 +163,7 @@ pub struct Facts {
 #[derive(Serialize, Debug, Clone, Default, PartialEq)]
 pub struct Metrics {
     pub boot_id: String,
+    pub iface: String,
     pub uptime: u64,
     pub cpu: f32,
     pub load: [f32; 3],
@@ -90,17 +183,38 @@ pub struct Metrics {
 }
 
 pub struct Collector {
-    nics: Vec<String>,
+    ifaces: Ifaces,
     prev_cpu: Option<(u64, u64)>,
-    prev_net: Option<(Instant, u64, u64)>,
+    prev_net_at: Option<Instant>,
+    prev_net: HashMap<String, (u64, u64)>,
     boot_id: String,
     load: [f32; 3],
     load_at: Option<Instant>,
 }
 
 impl Collector {
-    pub fn new(nics: Vec<String>) -> Self {
-        Self { nics, prev_cpu: None, prev_net: None, boot_id: boot_id(), load: [0.0; 3], load_at: None }
+    pub fn new(ifaces: Ifaces) -> Self {
+        Self {
+            ifaces,
+            prev_cpu: None,
+            prev_net_at: None,
+            prev_net: HashMap::new(),
+            boot_id: boot_id(),
+            load: [0.0; 3],
+            load_at: None,
+        }
+    }
+
+    pub fn counted_ifaces(&self) -> Vec<String> {
+        interface_table().iter().filter(|row| self.ifaces.counts(row)).map(interface_name).collect()
+    }
+
+    pub fn missing_ifaces(&self) -> Vec<String> {
+        if self.ifaces.only().is_empty() {
+            return Vec::new();
+        }
+        let known: Vec<String> = interface_table().iter().map(interface_name).collect();
+        self.ifaces.only().iter().filter(|name| !known.contains(name)).cloned().collect()
     }
 
     pub fn facts(&self) -> Facts {
@@ -129,14 +243,23 @@ impl Collector {
     pub fn collect(&mut self) -> Metrics {
         let (mem_total, mem_used, swap_total, swap_used) = memory();
         let (disk_total, disk_used) = disk_usage();
-        let (rx_total, tx_total) = net_totals(&self.nics);
+        let counted: Vec<(String, u64, u64)> = interface_table()
+            .iter()
+            .filter(|row| self.ifaces.counts(row))
+            .map(|row| (interface_name(row), row.InOctets, row.OutOctets))
+            .collect();
+        let (rx_total, tx_total) = counted
+            .iter()
+            .fold((0u64, 0u64), |(rx, tx), (_, r, t)| (rx.saturating_add(*r), tx.saturating_add(*t)));
+        let boot_id = epoch(&self.boot_id, counted.iter().map(|(name, ..)| name.as_str()));
         let now = Instant::now();
-        let (net_rx, net_tx) = self.net_rate(rx_total, tx_total, now);
+        let (net_rx, net_tx) = self.net_rate(&counted, now);
         let cpu = self.cpu_percent();
         self.update_load(cpu, now);
         let (tcp, udp) = conn_counts();
         Metrics {
-            boot_id: self.boot_id.clone(),
+            boot_id,
+            iface: self.ifaces.spec().to_owned(),
             uptime: uptime(),
             cpu,
             load: self.load,
@@ -176,22 +299,29 @@ impl Collector {
         }
     }
 
-    fn net_rate(&mut self, rx: u64, tx: u64, now: Instant) -> (u64, u64) {
-        let rate = match self.prev_net {
-            Some((previous, previous_rx, previous_tx)) => {
+    fn net_rate(&mut self, counted: &[(String, u64, u64)], now: Instant) -> (u64, u64) {
+        let rate = match self.prev_net_at {
+            Some(previous) => {
                 let secs = now.saturating_duration_since(previous).as_secs_f64();
                 if secs <= 0.0 {
                     (0, 0)
                 } else {
-                    (
-                        (rx.saturating_sub(previous_rx) as f64 / secs) as u64,
-                        (tx.saturating_sub(previous_tx) as f64 / secs) as u64,
-                    )
+                    let (rx, tx) = counted
+                        .iter()
+                        .filter_map(|(name, rx, tx)| {
+                            let (prev_rx, prev_tx) = self.prev_net.get(name)?;
+                            Some((rx.saturating_sub(*prev_rx), tx.saturating_sub(*prev_tx)))
+                        })
+                        .fold((0u64, 0u64), |(rx, tx), (delta_rx, delta_tx)| {
+                            (rx.saturating_add(delta_rx), tx.saturating_add(delta_tx))
+                        });
+                    ((rx as f64 / secs) as u64, (tx as f64 / secs) as u64)
                 }
             }
             None => (0, 0),
         };
-        self.prev_net = Some((now, rx, tx));
+        self.prev_net = counted.iter().map(|(name, rx, tx)| (name.clone(), (*rx, *tx))).collect();
+        self.prev_net_at = Some(now);
         rate
     }
 }
@@ -271,12 +401,62 @@ fn uptime() -> u64 {
     unsafe { GetTickCount64() / 1000 }
 }
 
+fn boot_guid(guid: GUID) -> Option<String> {
+    if guid.data1 == 0 && guid.data2 == 0 && guid.data3 == 0 && guid.data4 == [0; 8] {
+        return None;
+    }
+    let [d0, d1, d2, d3, d4, d5, d6, d7] = guid.data4;
+    Some(format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid.data1, guid.data2, guid.data3, d0, d1, d2, d3, d4, d5, d6, d7
+    ))
+}
+
+fn query_boot_guid() -> Option<String> {
+    let mut info = SystemBootEnvironmentInfo::default();
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_BOOT_ENVIRONMENT_INFORMATION_CLASS,
+            (&mut info as *mut SystemBootEnvironmentInfo).cast(),
+            size_of::<SystemBootEnvironmentInfo>() as u32,
+            null_mut(),
+        )
+    };
+    (status >= 0).then(|| boot_guid(info.boot_identifier)).flatten()
+}
+
+fn query_boot_time() -> Option<u64> {
+    let mut info = SYSTEM_TIMEOFDAY_INFORMATION::default();
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SystemTimeOfDayInformation,
+            (&mut info as *mut SYSTEM_TIMEOFDAY_INFORMATION).cast(),
+            size_of::<SYSTEM_TIMEOFDAY_INFORMATION>() as u32,
+            null_mut(),
+        )
+    };
+    if status < 0 {
+        return None;
+    }
+    let boot_time = i64::from_ne_bytes(info.Reserved1[..8].try_into().ok()?);
+    let sleep_bias = u64::from_ne_bytes(info.Reserved1[40..48].try_into().ok()?);
+    (boot_time > 0)
+        .then_some((boot_time as u64).saturating_sub(sleep_bias).saturating_sub(WINDOWS_FILETIME_UNIX_OFFSET))
+}
+
 fn boot_id() -> String {
+    if let Some(id) = query_boot_guid() {
+        return format!("guid:{id}");
+    }
+    if let Some(boot_time) = query_boot_time() {
+        return format!("time:{boot_time}");
+    }
+
     let mut now = FILETIME::default();
     unsafe { GetSystemTimeAsFileTime(&mut now) };
     let now = filetime(now);
     let elapsed = unsafe { GetTickCount64() }.saturating_mul(10_000);
-    now.saturating_sub(elapsed).saturating_sub(WINDOWS_FILETIME_UNIX_OFFSET).to_string()
+    format!("estimate:{}", now.saturating_sub(elapsed).saturating_sub(WINDOWS_FILETIME_UNIX_OFFSET))
 }
 
 fn cpuinfo() -> (String, u32) {
@@ -287,19 +467,21 @@ fn cpuinfo() -> (String, u32) {
     (name.trim().to_owned(), cores.max(1))
 }
 
+fn pick_address(held: &[IpAddr], ipv6: bool) -> String {
+    held.iter()
+        .filter(|ip| ip.is_ipv6() == ipv6)
+        .min_by_key(|ip| !is_public(**ip))
+        .map_or_else(String::new, ToString::to_string)
+}
+
 fn addresses() -> (String, String) {
-    let (mut ipv4, mut ipv6) = (String::new(), String::new());
-    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if skip_iface(&iface.name) || iface.is_link_local() || !iface.is_oper_up() {
-            continue;
-        }
-        match iface.ip() {
-            std::net::IpAddr::V4(ip) if ipv4.is_empty() => ipv4 = ip.to_string(),
-            std::net::IpAddr::V6(ip) if ipv6.is_empty() => ipv6 = ip.to_string(),
-            _ => {}
-        }
-    }
-    (ipv4, ipv6)
+    let held: Vec<IpAddr> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|iface| !skip_iface(&iface.name) && !iface.is_link_local() && iface.is_oper_up())
+        .map(|iface| iface.ip())
+        .collect();
+    (pick_address(&held, false), pick_address(&held, true))
 }
 
 fn interface_table() -> Vec<MIB_IF_ROW2> {
@@ -323,27 +505,9 @@ fn interface_name(row: &MIB_IF_ROW2) -> String {
     }
 }
 
-fn net_totals(nics: &[String]) -> (u64, u64) {
-    interface_table()
-        .iter()
-        .filter(|row| counted(row, nics))
-        .fold((0, 0), |(rx, tx), row| (rx.saturating_add(row.InOctets), tx.saturating_add(row.OutOctets)))
-}
-
-fn counted(row: &MIB_IF_ROW2, nics: &[String]) -> bool {
-    let name = interface_name(row);
-    if !nics.is_empty() {
-        return nics.iter().any(|nic| nic == &name);
-    }
-    row.Type != 24 && !skip_iface(&name)
-}
-
-pub fn missing_nics(nics: &[String]) -> Vec<String> {
-    if nics.is_empty() {
-        return Vec::new();
-    }
-    let known: Vec<String> = interface_table().iter().map(interface_name).collect();
-    nics.iter().filter(|nic| !known.contains(nic)).cloned().collect()
+#[cfg(test)]
+fn counted(row: &MIB_IF_ROW2, ifaces: &Ifaces) -> bool {
+    ifaces.counts(row)
 }
 
 fn skip_iface(name: &str) -> bool {
@@ -461,6 +625,104 @@ mod tests {
     }
 
     #[test]
+    fn boot_guid_formats_as_a_stable_identifier() {
+        let guid = GUID {
+            data1: 0x0123_4567,
+            data2: 0x89ab,
+            data3: 0xcdef,
+            data4: [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
+        };
+        assert_eq!(boot_guid(guid).as_deref(), Some("01234567-89ab-cdef-0123-456789abcdef"));
+        assert_eq!(boot_guid(GUID::default()), None);
+
+        assert!(
+            query_boot_guid().is_some() || query_boot_time().is_some(),
+            "a kernel boot-time API must be available"
+        );
+        if let Some(first) = query_boot_guid() {
+            assert_eq!(query_boot_guid(), Some(first));
+        }
+        if let Some(first) = query_boot_time() {
+            assert_eq!(query_boot_time(), Some(first));
+        }
+        assert_eq!(boot_id(), boot_id(), "the OS boot id must not vary between samples");
+    }
+
+    #[test]
+    fn iface_is_in_the_metrics_protocol() {
+        let metrics = Metrics { iface: "Ethernet,-vEthernet (WSL)".into(), ..Metrics::default() };
+        let json = serde_json::to_value(metrics).unwrap();
+        assert_eq!(json["iface"], "Ethernet,-vEthernet (WSL)");
+    }
+
+    #[test]
+    fn public_addresses_win_within_each_family() {
+        let held: [IpAddr; 4] = [
+            "10.0.0.2".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+            "fd00::1".parse().unwrap(),
+            "2001:4860:4860::8888".parse().unwrap(),
+        ];
+        assert_eq!(pick_address(&held, false), "8.8.8.8");
+        assert_eq!(pick_address(&held, true), "2001:4860:4860::8888");
+        assert!(is_public("8.8.8.8".parse().unwrap()));
+        assert!(!is_public("100.64.1.2".parse().unwrap()));
+        assert!(!is_public("198.18.0.1".parse().unwrap()));
+        assert!(!is_public("fd00::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn interface_filters_support_inclusions_exclusions_and_legacy_names() {
+        let mut row = MIB_IF_ROW2::default();
+        let alias = wide("vEthernet (WSL)");
+        row.Alias[..alias.len()].copy_from_slice(&alias);
+        assert!(!counted(&row, &Ifaces::default()));
+        assert!(counted(&row, &Ifaces::parse("vEthernet (WSL)").unwrap()));
+        assert!(!counted(&row, &Ifaces::parse("Ethernet,-vEthernet (WSL)").unwrap()));
+        assert!(!counted(&row, &Ifaces::parse("-vEthernet (WSL)").unwrap()));
+        assert!(counted(&row, &Ifaces::from_legacy(vec!["vEthernet (WSL)".into()])));
+        row.Type = 131;
+        let tunnel_alias = wide("Secure Gateway");
+        row.Alias[..tunnel_alias.len()].copy_from_slice(&tunnel_alias);
+        assert!(!counted(&row, &Ifaces::default()), "tunnels are excluded by default");
+        assert!(
+            counted(&row, &Ifaces::parse("Secure Gateway").unwrap()),
+            "explicit selection overrides defaults"
+        );
+    }
+
+    #[test]
+    fn iface_parser_normalizes_lists_and_rejects_ambiguous_names() {
+        let ifaces = Ifaces::parse(" Ethernet , Wi-Fi, -vEthernet (WSL), ").unwrap();
+        assert_eq!(ifaces.spec(), "Ethernet,Wi-Fi,-vEthernet (WSL)");
+        assert_eq!(ifaces.only(), ["Ethernet", "Wi-Fi"]);
+        for invalid in ["-", "--Ethernet", "eth0,\ninvalid"] {
+            assert!(Ifaces::parse(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(Ifaces::parse(" , ").unwrap().spec().is_empty());
+    }
+
+    #[test]
+    fn interface_epoch_tracks_the_sorted_counted_set() {
+        let value = |names: &[&str]| epoch("boot", names.iter().copied());
+        assert_ne!(value(&["Ethernet"]), value(&["Ethernet", "Wi-Fi"]));
+        assert_ne!(value(&["Ethernet"]), value(&[]));
+        assert_eq!(value(&["Wi-Fi", "Ethernet"]), value(&["Ethernet", "Wi-Fi"]));
+    }
+
+    #[test]
+    fn network_rates_ignore_joining_adapters_and_counter_resets() {
+        let start = Instant::now();
+        let mut collector = Collector::new(Ifaces::default());
+        collector.prev_net_at = Some(start);
+        collector.prev_net.insert("Ethernet".into(), (100, 200));
+        let current = vec![("Ethernet".into(), 150, 270), ("Wi-Fi".into(), 900, 900)];
+        assert_eq!(collector.net_rate(&current, start + std::time::Duration::from_secs(1)), (50, 70));
+        let reset = vec![("Ethernet".into(), 5, 10)];
+        assert_eq!(collector.net_rate(&reset, start + std::time::Duration::from_secs(2)), (0, 0));
+    }
+
+    #[test]
     fn virtual_interfaces_are_not_billed_by_default() {
         for name in ["vEthernet (WSL)", "Loopback Pseudo-Interface 1", "Tailscale"] {
             assert!(skip_iface(name), "{name}");
@@ -469,12 +731,11 @@ mod tests {
     }
 
     #[test]
-    fn named_interfaces_override_virtual_interface_filtering() {
-        let mut row = MIB_IF_ROW2::default();
-        let alias = wide("vEthernet");
+    fn listed_adapter_alias_overrides_default_filtering() {
+        let mut row = MIB_IF_ROW2 { Type: 24, ..Default::default() };
+        let alias = wide("Loopback Pseudo-Interface 1");
         row.Alias[..alias.len()].copy_from_slice(&alias);
-        assert!(!counted(&row, &[]));
-        assert!(counted(&row, &["vEthernet".into()]));
-        assert!(!counted(&row, &["Ethernet".into()]));
+        assert!(!counted(&row, &Ifaces::default()));
+        assert!(counted(&row, &Ifaces::parse("Loopback Pseudo-Interface 1").unwrap()));
     }
 }

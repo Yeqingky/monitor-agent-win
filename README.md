@@ -4,6 +4,16 @@
 
 `monitor-agent` 是 monitor hub 的 Windows 主机 agent, 使用 WebSocket 上报本机指标并执行 hub 下发的 TCP 探测任务.
 
+## 版本兼容性
+
+尽量与官方agent版本号对应.
+
+| 官方 agent | agent-win (当前项目) |
+|:---:|:---:|
+| [v1.1.0](https://github.com/monitor-probe/agent/releases/tag/v1.1.0) | [v1.1.0](https://github.com/Yeqingky/monitor-agent-win/releases/tag/v1.1.0) |
+| [v1.0.0](https://github.com/monitor-probe/agent/releases/tag/v1.0.0) | [v1.0.0](https://github.com/Yeqingky/monitor-agent-win/releases/tag/v1.0.0) , [v1.0.1](https://github.com/Yeqingky/monitor-agent-win/releases/tag/v1.0.1) |
+
+
 ## 架构
 
 - `src/main.rs`: 参数解析, 配置文件, Windows Service 生命周期, WebSocket 会话, 重连退避和 TCP 探测任务.
@@ -56,7 +66,7 @@
 .\monitor-agent.exe --server https://example.com --token <token>
 ```
 
-支持环境变量 `MONITOR_SERVICE_NAME`, `MONITOR_SERVER`, `MONITOR_TOKEN`, `MONITOR_INTERVAL`, `MONITOR_NICS` 和 `MONITOR_INSECURE`. 配置文件优先于环境变量, 命令行参数优先于配置文件. 重复执行 `install` 且服务名相同会更新该服务和配置; 使用不同服务名即可共存多个 agent.
+支持环境变量 `MONITOR_SERVICE_NAME`, `MONITOR_SERVER`, `MONITOR_TOKEN`, `MONITOR_INTERVAL`, `MONITOR_IFACE` 和 `MONITOR_INSECURE`. 配置文件优先于环境变量, 命令行参数优先于配置文件. `MONITOR_NICS` 与 `--nics` 保留为旧配置兼容入口. 重复执行 `install` 且服务名相同会更新该服务和配置; 使用不同服务名即可共存多个 agent.
 
 | 参数 | 默认 | 说明 |
 |---|---:|---|
@@ -65,27 +75,29 @@
 | `--service-name` | `monitor-agent` | Windows Service 名称 |
 | `--config` | `%ProgramData%\monitor-agent\agent.env` | 配置文件路径, 默认按服务名区分 |
 | `--interval` | 1 | 上报间隔, 1-3600 秒 |
-| `--nics` | 空 | 只统计指定 adapter alias, 逗号分隔 |
+| `--iface` | 空 | 网卡选择, adapter alias 逗号分隔; 正向列表只统计列出的网卡, `-名称` 从默认统计集合中排除, 排除优先 |
+| `--nics` | 空 | 旧参数, 等价于只统计列出的 adapter alias |
 | `--insecure` | 关闭 | 允许远端使用明文 `ws://`, token 会以明文传输 |
 
 ## 上报字段
 
 - `Facts`: 主机名, Windows 版本, 架构, 虚拟化类型, CPU 型号和核数, 内存, page file, 磁盘总量, IPv4 / IPv6.
 - `Metrics`: CPU, load, 内存, page file, 磁盘, 网卡收发速率和累计计数器, TCP / UDP 数量, 进程数, uptime.
-- `boot_id`: hub 判断主机重启的依据.
-- `net_rx_total` / `net_tx_total`: 系统累计字节计数器, hub 负责跨上报累加.
+- `boot_id`: hub 判断主机重启和网卡计数集合变化的依据.
+- `iface`: 当前 `--iface` 选择, 空值代表默认过滤规则, hub 可据此展示当前设置.
+- `net_rx_total` / `net_tx_total`: 所选网卡的系统累计字节计数器, hub 负责跨上报累加.
 
 Windows 没有等价的内核 load-average 计数器, `load` 是按 1 / 5 / 15 分钟窗口平滑后的 CPU demand, 单位为逻辑 CPU 数. 磁盘统计 fixed logical drives, 不统计网络盘、光盘和可移动盘.
 
 ### 网卡选择
 
-默认过滤 loopback、容器、隧道和常见虚拟网卡. 指定 `--nics` 后列表替换默认过滤规则, 名称精确匹配, 重复名称只计一次. Windows 使用系统报告的 adapter alias, 例如 `Ethernet` 或 `Wi-Fi`:
+默认过滤 loopback、容器、隧道和常见虚拟网卡. `--iface` 的正向列表替换默认过滤规则, `-alias` 从默认集合中排除网卡, 排除优先于列出. 名称精确匹配 Windows adapter alias; 多个名称用逗号分隔, alias 含空格时请给整个参数加引号. 不存在的正向名称会在启动时提示, 并按 0 字节统计. 空 `--iface` 恢复默认规则.
 
 ```powershell
-.\monitor-agent.exe install --server https://example.com --token <token> --nics Ethernet,Wi-Fi
+.\monitor-agent.exe install --server https://example.com --token <token> --iface "Ethernet,-vEthernet (WSL)"
 ```
 
-不存在的名称会在启动时提示, 并按 0 字节统计.
+旧版 `--nics` / `MONITOR_NICS` 仍可读取, 语义为只统计所列网卡, 新安装配置统一写入 `MONITOR_IFACE`.
 
 ## 构建和验证
 

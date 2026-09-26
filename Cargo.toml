@@ -1,6 +1,6 @@
 [package]
 name = "monitor-agent"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license = "MIT"
 description = "Windows monitoring agent for the monitor hub"
@@ -33,7 +33,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
     "Wdk_System_SystemServices",
+    "Wdk_System_SystemInformation",
 ] }
 
 [dev-dependencies]
