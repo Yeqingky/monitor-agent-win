@@ -590,27 +590,78 @@ fn registry_string(path: &str, value: &str) -> Option<String> {
     Some(wide_string(&words))
 }
 
+/// The virtualization this system runs under, `none` on bare metal. A
+/// container is not told from the machine whose kernel it shares: Windows
+/// containers are not this agent's target.
 fn virtualization() -> String {
-    let values = [
+    hypervisor().unwrap_or("none").into()
+}
+
+/// The hypervisor beneath this system, `None` on bare metal. A hypervisor
+/// names itself in CPUID leaf 0x40000000, behind the hypervisor bit of leaf 1;
+/// one that clears the bit leaves its guest reported as bare metal. Its DMI
+/// strings are the provider's to choose -- `KVM`, `QEMU`, a cloud's own name
+/// -- and would name one hypervisor several ways.
+fn hypervisor() -> Option<&'static str> {
+    let signature = cpuid_signature()?;
+    match signature_name(&signature) {
+        // The one signature a guest shares with its host: the root partition
+        // of a Hyper-V machine, and a bare machine whose VBS runs the OS under
+        // the same hypervisor, read Microsoft's beside their own OEM firmware.
+        Some("hyper-v") => firmware_named_hypervisor(),
+        Some(name) => Some(name),
+        None => Some("vm"),
+    }
+}
+
+/// The 12-byte vendor signature of CPUID leaf 0x40000000, `None` where leaf 1
+/// reports no hypervisor.
+fn cpuid_signature() -> Option<[u8; 12]> {
+    use std::arch::x86_64::__cpuid;
+    if __cpuid(1).ecx >> 31 == 0 {
+        return None;
+    }
+    let leaf = __cpuid(0x4000_0000);
+    let mut signature = [0; 12];
+    for (bytes, reg) in signature.chunks_mut(4).zip([leaf.ebx, leaf.ecx, leaf.edx]) {
+        bytes.copy_from_slice(&reg.to_le_bytes());
+    }
+    Some(signature)
+}
+
+/// The hypervisor a 12-byte CPUID signature names, `None` for a signature
+/// that is none of these (reported as a plain `vm`).
+fn signature_name(signature: &[u8; 12]) -> Option<&'static str> {
+    Some(match signature {
+        b"KVMKVMKVM\0\0\0" | b"Linux KVM Hv" => "kvm",
+        b"TCGTCGTCGTCG" => "qemu",
+        b"Microsoft Hv" => "hyper-v",
+        b"VMwareVMware" => "vmware",
+        b"VBoxVBoxVBox" => "virtualbox",
+        b"XenVMMXenVMM" => "xen",
+        b"bhyve bhyve " => "bhyve",
+        _ => return None,
+    })
+}
+
+/// The hypervisor a Microsoft CPUID signature hides, told from the firmware
+/// strings an administrator reads in `msinfo32`. A Xen guest offered the
+/// Hyper-V interface still names Xen, and AWS and Google run their instances
+/// on KVM. `None` when they name no hypervisor: that is the root partition of
+/// a Hyper-V machine, or a bare machine with VBS on.
+fn firmware_named_hypervisor() -> Option<&'static str> {
+    let text = [
         registry_string(r"HARDWARE\DESCRIPTION\System\BIOS", "SystemManufacturer"),
         registry_string(r"HARDWARE\DESCRIPTION\System\BIOS", "SystemProductName"),
-    ];
-    let text = values.iter().filter_map(Option::as_deref).collect::<Vec<_>>().join(" ").to_ascii_lowercase();
-    for (needle, name) in [
-        ("vmware", "vmware"),
-        ("virtualbox", "virtualbox"),
-        ("qemu", "qemu"),
-        ("kvm", "kvm"),
-        ("xen", "xen"),
-        ("amazon", "amazon"),
-        ("google", "google"),
-        ("virtual machine", "hyper-v"),
-    ] {
-        if text.contains(needle) {
-            return name.into();
-        }
-    }
-    "none".into()
+    ]
+    .iter()
+    .filter_map(Option::as_deref)
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase();
+    [("xen", "xen"), ("amazon", "kvm"), ("google", "kvm"), ("virtual machine", "hyper-v")]
+        .into_iter()
+        .find_map(|(needle, name)| text.contains(needle).then_some(name))
 }
 
 #[cfg(test)]
@@ -720,6 +771,23 @@ mod tests {
         assert_eq!(collector.net_rate(&current, start + std::time::Duration::from_secs(1)), (50, 70));
         let reset = vec![("Ethernet".into(), 5, 10)];
         assert_eq!(collector.net_rate(&reset, start + std::time::Duration::from_secs(2)), (0, 0));
+    }
+
+    #[test]
+    fn a_cpuid_signature_is_named_as_the_linux_agent_names_it() {
+        for (signature, name) in [
+            (b"KVMKVMKVM\0\0\0", "kvm"),
+            (b"Linux KVM Hv", "kvm"),
+            (b"TCGTCGTCGTCG", "qemu"),
+            (b"Microsoft Hv", "hyper-v"),
+            (b"VMwareVMware", "vmware"),
+            (b"VBoxVBoxVBox", "virtualbox"),
+            (b"XenVMMXenVMM", "xen"),
+            (b"bhyve bhyve ", "bhyve"),
+        ] {
+            assert_eq!(signature_name(signature), Some(name), "{signature:?}");
+        }
+        assert_eq!(signature_name(b"GenuineIntel"), None);
     }
 
     #[test]

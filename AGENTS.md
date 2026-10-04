@@ -46,3 +46,5 @@ Windows 交叉编译需要 `x86_64-w64-mingw32-gcc`. 本机没有 Windows runtim
 - Windows Service 必须支持 Stop 和 Shutdown, 正常退出时报告 `Stopped`, 异常退出时由 SCM failure actions 自动重启.
 - hub 下发的 ping task 必须有并发上限, 不能信任 hub 提供的任务数量.
 - 采集失败时优先返回 0 或空值并继续上报, 不得因为单个可选指标让 WebSocket 主循环退出.
+- 连上 hub 后先采一次基线, 首份 Metrics 必须比基线晚一秒发出; CPU, load 与网速不得上报 0 或断线期间的平均值.
+- Facts.virt 按 CPUID 签名识别 (x86-64), 取值 kvm, qemu, hyper-v, vmware, virtualbox, xen, bhyve, vm, none; Microsoft 签名必须用固件字符串区分 Hyper-V 虚拟机与 Hyper-V 宿主机/VBS 物理机, 词表与 Linux agent 1.2.0 对齐.

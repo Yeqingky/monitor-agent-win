@@ -12,6 +12,7 @@
 
 | 官方 agent | agent-win (当前项目) |
 |:---:|:---:|
+| [v1.2.0](https://github.com/monitor-probe/agent/releases/tag/v1.2.0) | [v1.2.0](https://github.com/Yeqingky/monitor-agent-win/releases/tag/v1.2.0) |
 | [v1.1.0](https://github.com/monitor-probe/agent/releases/tag/v1.1.0) | [v1.1.0](https://github.com/Yeqingky/monitor-agent-win/releases/tag/v1.1.0) |
 | [v1.0.0](https://github.com/monitor-probe/agent/releases/tag/v1.0.0) | [v1.0.0](https://github.com/Yeqingky/monitor-agent-win/releases/tag/v1.0.0) , [v1.0.1](https://github.com/Yeqingky/monitor-agent-win/releases/tag/v1.0.1) |
 
@@ -125,7 +126,7 @@ Windows 没有等价的内核 load-average 计数器, `load` 是按 1 / 5 / 15 �
 不监听`以太网`:
 
 ```powershell
-.\monitor-agent.exe install --server https://example.com --token <token> --alias "以太网"
+.\monitor-agent.exe install --server https://example.com --token <token> --iface "-以太网"
 ```
 
 ## 构建和验证

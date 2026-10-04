@@ -931,7 +931,13 @@ async fn session(
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
-    let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+    // The baseline is taken a second before the first report, which then
+    // measures CPU and network over that second rather than over nothing --
+    // all a freshly started process has -- or over the outage since the
+    // previous session.
+    collector.collect();
+    let mut ticker =
+        tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let result = loop {
