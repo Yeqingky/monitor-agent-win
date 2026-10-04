@@ -4,6 +4,8 @@
 
 `monitor-agent` 是 monitor hub 的 Windows 主机 agent, 使用 WebSocket 上报本机指标并执行 hub 下发的 TCP 探测任务.
 
+> 只维护 x86-64/amd64 版本的 monitor agent. 因为没有其他测试环境.
+
 ## 版本兼容性
 
 尽量与官方agent版本号对应.
@@ -42,7 +44,20 @@
 - 配置服务失败后 5 / 30 / 60 秒自动重启.
 - 启动服务.
 
-服务管理:
+## 更新
+
+下载新版 exe 文件, 以管理员身份运行 PowerShell:
+
+```powershell
+.\monitor-agent.exe install
+```
+
+覆盖更新:
+```powershell
+.\monitor-agent.exe install --server https://example.com --token <token>
+```
+
+## 服务管理
 
 ```powershell
 .\monitor-agent.exe status
@@ -60,11 +75,15 @@
 
 `uninstall` 只删除指定服务, 保留对应配置文件, 便于重新安装. 如需删除 token, 请在确认后手动删除 `%ProgramData%\monitor-agent`.
 
+## 前台运行
+
 也可以以前台进程运行, 便于调试:
 
 ```powershell
 .\monitor-agent.exe --server https://example.com --token <token>
 ```
+
+## 环境变量/参数
 
 支持环境变量 `MONITOR_SERVICE_NAME`, `MONITOR_SERVER`, `MONITOR_TOKEN`, `MONITOR_INTERVAL`, `MONITOR_IFACE` 和 `MONITOR_INSECURE`. 配置文件优先于环境变量, 命令行参数优先于配置文件. `MONITOR_NICS` 与 `--nics` 保留为旧配置兼容入口. 重复执行 `install` 且服务名相同会更新该服务和配置; 使用不同服务名即可共存多个 agent.
 
@@ -89,15 +108,25 @@
 
 Windows 没有等价的内核 load-average 计数器, `load` 是按 1 / 5 / 15 分钟窗口平滑后的 CPU demand, 单位为逻辑 CPU 数. 磁盘统计 fixed logical drives, 不统计网络盘、光盘和可移动盘.
 
-### 网卡选择
+## 网卡选择
 
-默认过滤 loopback、容器、隧道和常见虚拟网卡. `--iface` 的正向列表替换默认过滤规则, `-alias` 从默认集合中排除网卡, 排除优先于列出. 名称精确匹配 Windows adapter alias; 多个名称用逗号分隔, alias 含空格时请给整个参数加引号. 不存在的正向名称会在启动时提示, 并按 0 字节统计. 空 `--iface` 恢复默认规则.
+默认过滤 loopback、容器、隧道和常见虚拟网卡. 
+`--iface` 的正向列表替换默认过滤规则, `-alias` 从默认集合中排除网卡, 排除优先于列出. 
+名称精确匹配 Windows adapter alias; 多个名称用逗号分隔, alias 含空格时请给整个参数加引号. 不存在的正向名称会在启动时提示, 并按 0 字节统计. 空 `--iface` 恢复默认规则.
+
+可以通过在 Powershell中执行 `netsh.exe interface show interface` 列出网卡.
+
+仅监听`以太网`:
 
 ```powershell
-.\monitor-agent.exe install --server https://example.com --token <token> --iface "Ethernet,-vEthernet (WSL)"
+.\monitor-agent.exe install --server https://example.com --token <token> --iface "以太网"
 ```
 
-旧版 `--nics` / `MONITOR_NICS` 仍可读取, 语义为只统计所列网卡, 新安装配置统一写入 `MONITOR_IFACE`.
+不监听`以太网`:
+
+```powershell
+.\monitor-agent.exe install --server https://example.com --token <token> --alias "以太网"
+```
 
 ## 构建和验证
 
