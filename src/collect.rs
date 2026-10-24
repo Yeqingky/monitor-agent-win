@@ -490,21 +490,21 @@ fn addresses() -> (String, String) {
 /// adapter lends none: its addresses belong to the containers, guests or
 /// overlay behind it.
 ///
-/// WireGuard is the exception for a public v6, since a machine without IPv6
-/// of its own gets a routed prefix through one. A tunnel's own addresses are
-/// private, CGNAT or ULA, which [`is_public`] rejects. Cloudflare WARP is the
-/// one that is not: `wgcf` puts a global 2606:4700::/32 address on the tunnel,
-/// shared by every user of the service and not reachable from outside, so that
-/// range is left out.
+/// Cloudflare WARP's `2606:4700::/32` IPv6 range is shared and not reachable
+/// from outside, so it is rejected regardless of the adapter alias. WireGuard
+/// is otherwise the exception for a public IPv6 address: a machine without
+/// IPv6 of its own may have a routed prefix through the tunnel.
 ///
 /// Windows adapter aliases carry the tunnel's name rather than a kernel name,
 /// `wg0` by default and a name holding `wireguard` when a user spelled it so;
 /// both are recognised here.
 fn lends_address(name: &str, ip: IpAddr) -> bool {
+    if matches!(ip, IpAddr::V6(v6) if v6.segments()[..2] == [0x2606, 0x4700]) {
+        return false;
+    }
     let lower = name.to_ascii_lowercase();
     if lower.starts_with("wg") || lower.contains("wireguard") {
-        let routed = |v6: std::net::Ipv6Addr| is_public(ip) && v6.segments()[..2] != [0x2606, 0x4700];
-        return matches!(ip, IpAddr::V6(v6) if routed(v6));
+        return matches!(ip, IpAddr::V6(_) if is_public(ip));
     }
     !skip_iface(name)
 }
@@ -830,14 +830,16 @@ mod tests {
         assert!(!lends_address("wg0", ip("203.0.113.9")), "only v6 is asked of a tunnel");
         assert!(!lends_address("wg0", ip("10.0.0.2")), "a VPN's own address is not the machine's");
         assert!(!lends_address("wg0", ip("fd00::2")));
-        assert!(!lends_address("wgcf", ip("2606:4700:110:8a36::1")), "WARP's shared address");
+        for name in ["wgcf", "warp", "CloudflareWARP", "Ethernet"] {
+            assert!(
+                !lends_address(name, ip("2606:4700:110:8a36::1")),
+                "WARP's shared address is excluded on every adapter ({name})"
+            );
+        }
         assert!(lends_address("WireGuard Home", ip("2001:db8::2")), "the word names the same tunnel");
         assert!(!lends_address("WireGuard Home", ip("10.7.0.2")));
         assert!(!lends_address("vEthernet (WSL)", ip("2001:db8::1")), "a virtual adapter lends nothing");
-        assert!(
-            lends_address("Ethernet", ip("2606:4700:110:8a36::1")),
-            "the range is left out only on a tunnel"
-        );
+        assert!(lends_address("Ethernet", ip("2001:db8::2")), "ordinary adapters lend public IPv6");
 
         // What `addresses` makes of a machine with a private v4 and a v6 only
         // through WireGuard.

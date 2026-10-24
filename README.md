@@ -12,6 +12,7 @@
 
 | 官方 agent | agent-win (当前项目) |
 |:---:|:---:|
+| [v1.2.3](https://github.com/monitor-probe/agent/releases/tag/v1.2.3) | [v1.2.3](https://github.com/Yeqingky/monitor-agent-win/releases/tag/v1.2.3) |
 | [v1.2.2](https://github.com/monitor-probe/agent/releases/tag/v1.2.2) | [v1.2.2](https://github.com/Yeqingky/monitor-agent-win/releases/tag/v1.2.2) |
 | [v1.2.1](https://github.com/monitor-probe/agent/releases/tag/v1.2.1) | [v1.2.1](https://github.com/Yeqingky/monitor-agent-win/releases/tag/v1.2.1) |
 | [v1.2.0](https://github.com/monitor-probe/agent/releases/tag/v1.2.0) | [v1.2.0](https://github.com/Yeqingky/monitor-agent-win/releases/tag/v1.2.0) |
@@ -109,9 +110,11 @@
 - `iface`: 当前 `--iface` 选择, 空值代表默认过滤规则, hub 可据此展示当前设置.
 - `net_rx_total` / `net_tx_total`: 所选网卡的系统累计字节计数器, hub 负责跨上报累加.
 
+`Facts` 每 60 秒重采一次. 变化时在当前 WebSocket 会话发送新的 `hello`, 无需等到重连.
+
 Windows 没有等价的内核 load-average 计数器, `load` 是按 1 / 5 / 15 分钟窗口平滑后的 CPU demand, 单位为逻辑 CPU 数. 磁盘统计 fixed logical drives, 不统计网络盘、光盘和可移动盘.
 
-每个地址族上报最可公网路由的本机地址. WireGuard 隧道 (adapter alias 为 `wg*` 或含 `wireguard`) 上的公网 IPv6 会上报, 隧道自身的私网地址和 Cloudflare WARP 的共享段 `2606:4700::/32` 除外. 本机 IPv4 为私网地址时, agent 会在会话之外向 hub 的 `/api/agent/echo` 另开一条只握手的短连接, 让面板显示该节点另一地址族的出口 (需要 hub 1.4.1 及以上; 失败每 30 秒重试, 最多 3 次, 不影响正常上报).
+每个地址族上报最可公网路由的本机地址. WireGuard 隧道 (adapter alias 为 `wg*` 或含 `wireguard`) 上的公网 IPv6 会上报, 隧道自身的私网地址除外; Cloudflare WARP 的共享段 `2606:4700::/32` 在任何网卡上都不作为本机地址上报. 本机 IPv4 为私网地址时, agent 会在会话之外向 hub 的 `/api/agent/echo` 另开一条只握手的短连接, 让面板显示该节点另一地址族的出口 (需要 hub 1.4.1 及以上; 失败每 30 秒重试, 最多 3 次, 不影响正常上报).
 
 ## 网卡选择
 

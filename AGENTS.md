@@ -39,7 +39,8 @@ Windows 交叉编译需要 `x86_64-w64-mingw32-gcc`. 本机没有 Windows runtim
 - `--iface` 使用精确 adapter alias 名称, 支持只统计列表和 `-名称` 排除; 排除优先, 空值使用默认虚拟接口过滤规则, 拒绝控制字符. `--nics` / `MONITOR_NICS` 只作为旧配置兼容入口.
 - `Metrics.iface` 必须报告当前选择; `boot_id` 在系统启动标识后附加按排序后统计网卡集合计算的稳定摘要, 集合变化时 hub 必须重新设基线.
 - 每个地址族优先报告可公网路由的本机地址. 当报告的 IPv4 地址不是公网地址时, 连接 hub 优先尝试 IPv4 地址, 使 NAT 后的 hub 能识别公网出口.
-- 网卡地址借用规则: WireGuard 隧道 (adapter alias 为 `wg*` 或含 `wireguard`) 只借出公网 IPv6, 隧道自身的私网地址与 Cloudflare WARP 的 `2606:4700::/32` 共享地址不得作为本机地址上报; 其余地址沿用默认虚拟网卡过滤规则.
+- 网卡地址借用规则: WireGuard 隧道 (adapter alias 为 `wg*` 或含 `wireguard`) 只借出公网 IPv6; 隧道自身的私网地址不借出. Cloudflare WARP 的 `2606:4700::/32` IPv6 共享地址在任何网卡上都不得作为本机地址上报; 其余地址沿用默认虚拟网卡过滤规则.
+- 每 60 秒重新采集一次 `Facts`; 与上次不同则在当前 WebSocket 会话重新发送 `hello`. 地址变化时, 还必须重新判断是否需要向另一地址族执行 `/api/agent/echo`.
 - 会话连接成功后, 若本机在会话所对端地址族持有私网地址, Agent 必须在会话之外向 hub 的 `/api/agent/echo` 另开一条只握手的短连接 (15 秒超时, 最多 3 次, 间隔 30 秒), 让 hub 记录另一地址族的出口; 该连接失败只记录日志, 不得影响主会话.
 - `--service-name` 默认为 `monitor-agent`. 相同服务名的 `install` 是升级和配置修改, 不同服务名必须使用独立配置目录并允许共存.
 - `install` 必须将当前 exe 复制到 `%ProgramData%\monitor-agent\monitor-agent.exe`, Service 不得依赖临时目录中的 exe. 替换共享副本前必须停止已配置的 agent 实例, 完成后恢复.

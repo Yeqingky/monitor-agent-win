@@ -674,10 +674,13 @@ fn parse_nics(value: &str) -> Vec<String> {
 fn ws_url(server: &str, insecure: bool) -> Result<String> {
     let base = server.trim_end_matches('/');
     let scheme = if insecure { "ws" } else { "wss" };
-    let base = match base.split_once("://") {
-        Some(("https", rest)) => format!("wss://{rest}"),
-        Some(("http", rest)) => format!("ws://{rest}"),
-        Some(("wss" | "ws", _)) => base.to_owned(),
+    // Schemes are case-insensitive (RFC 3986); normalize only the scheme so
+    // the original host and path remain unchanged.
+    let (given, rest) = base.split_once("://").unwrap_or(("", base));
+    let base = match given.to_ascii_lowercase().as_str() {
+        "https" => format!("wss://{rest}"),
+        "http" => format!("ws://{rest}"),
+        ws @ ("wss" | "ws") => format!("{ws}://{rest}"),
         _ => format!("{scheme}://{base}"),
     };
     // RFC 3986 places userinfo before the host, so `127.0.0.1:28080@evil.example.com`
@@ -872,6 +875,9 @@ const MAX_MESSAGE: usize = 64 * 1024;
 /// recovery at this constant rather than at tcp_retries2.
 const HUB_SILENCE: Duration = Duration::from_secs(90);
 
+/// How often a session recollects Facts and sends another hello when they change.
+const FACTS_RECHECK: Duration = Duration::from_secs(60);
+
 /// One connection: handshake, then report until the socket closes.
 async fn session(
     url: &str,
@@ -892,7 +898,7 @@ async fn session(
         .trim_end_matches(']')
         .to_owned();
     let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
-    let facts = collector.facts();
+    let mut facts = collector.facts();
     let connect = async {
         let stream = dial(&host, port, prefers_ipv4(&facts.ipv4)).await?;
         let peer = stream.peer_addr()?;
@@ -910,16 +916,19 @@ async fn session(
         .context("connect")?;
     agent_log!("connected to {peer}");
     *connected = Some(Instant::now());
-    if let Some(v6) = glimpse_family(peer.is_ipv6(), &facts.ipv4, &facts.ipv6) {
-        tokio::spawn(glimpse(url.to_owned(), token.to_owned(), host.clone(), port, v6));
-    }
+    let glimpse_from = |facts: &collect::Facts| {
+        if let Some(v6) = glimpse_family(peer.is_ipv6(), &facts.ipv4, &facts.ipv6) {
+            tokio::spawn(glimpse(url.to_owned(), token.to_owned(), host.clone(), port, v6));
+        }
+    };
+    glimpse_from(&facts);
     // The clock starts at the handshake and the hello below draws from it like
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
 
     let Some(result) = send_or_stop(
         &mut ws,
-        notify("hello", serde_json::to_value(facts)?),
+        notify("hello", serde_json::to_value(&facts)?),
         remaining(last_frame),
         shutdown.clone(),
     )
@@ -940,6 +949,9 @@ async fn session(
         tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let mut recheck = tokio::time::interval_at(Instant::now() + FACTS_RECHECK, FACTS_RECHECK);
+    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -948,6 +960,25 @@ async fn session(
                     break Ok(())
                 };
                 if let Err(error) = result { break Err(error); }
+            }
+            _ = recheck.tick() => {
+                let fresh = collector.facts();
+                if fresh == facts {
+                    continue;
+                }
+                if (&fresh.ipv4, &fresh.ipv6) != (&facts.ipv4, &facts.ipv6) {
+                    glimpse_from(&fresh);
+                }
+                let hello = notify("hello", serde_json::to_value(&fresh)?);
+                let Some(result) =
+                    send_or_stop(&mut ws, hello, remaining(last_frame), shutdown.clone()).await
+                else {
+                    break Ok(())
+                };
+                if let Err(error) = result {
+                    break Err(error);
+                }
+                facts = fresh;
             }
             // Rebuilt each pass from the last frame, so silence costs exactly
             // HUB_SILENCE rather than a polling interval more. Kept separate
@@ -1368,6 +1399,11 @@ mod tests {
     #[test]
     fn ws_url_upgrades_scheme_and_refuses_plaintext_to_remote() {
         assert_eq!(ws_url("https://hub.example.com/", false).unwrap(), "wss://hub.example.com/api/agent/ws");
+        assert_eq!(ws_url("HTTPS://hub.example.com/", false).unwrap(), "wss://hub.example.com/api/agent/ws");
+        assert_eq!(ws_url("HTTP://127.0.0.1:28080", false).unwrap(), "ws://127.0.0.1:28080/api/agent/ws");
+        assert_eq!(ws_url("WSS://hub.example.com", false).unwrap(), "wss://hub.example.com/api/agent/ws");
+        assert!(ws_url("HTTP://hub.example.com", false).is_err());
+        assert!(ws_url("WS://hub.example.com", false).is_err());
         assert_eq!(ws_url("http://127.0.0.1:28080", false).unwrap(), "ws://127.0.0.1:28080/api/agent/ws");
         // A bare host defaults to TLS rather than leaking the token.
         assert!(ws_url("hub.example.com", false).unwrap().starts_with("wss://"));
